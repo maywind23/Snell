@@ -22,6 +22,12 @@ chmod +x Snell.sh
 sudo ./Snell.sh install
 ```
 
+如需自定义管理面板的监听端口，可在安装时追加 `--web-port`（或别名 `--admin-port`）参数，例如：
+
+```bash
+sudo ./Snell.sh install --web-port 7001
+```
+
 安装过程中脚本会：
 
 1. 安装依赖（curl、jq、busybox、iptables 等）。
@@ -29,7 +35,7 @@ sudo ./Snell.sh install
 3. 创建 `snell-server@.service` systemd 模板，支持多实例运行。
 4. 生成管理目录 `/etc/snell`、`/opt/snell-admin` 以及 Web 静态资源与 CGI 脚本。
 5. 初始化 iptables `SNELL-TRACK` 链以统计端口流量。
-6. 创建并启动 `snell-admin.service`（基于 busybox httpd），默认监听 `6180` 端口。
+6. 创建并启动 `snell-admin.service`（基于 busybox httpd），默认监听 `6180` 端口，可通过安装参数覆盖。
 7. 生成管理员访问令牌并保存在 `/etc/snell/admin.conf`。
 
 安装成功后，可通过浏览器访问 `http://服务器IP:6180/` 进入管理页面。首次访问需输入脚本输出的管理令牌。
@@ -38,6 +44,7 @@ sudo ./Snell.sh install
 
 ```bash
 ./Snell.sh install       # 安装 Snell 及 Web 管理面板
+./Snell.sh install --web-port 7001  # 安装时自定义管理面板端口
 ./Snell.sh uninstall     # 卸载所有组件与数据
 ./Snell.sh list-users    # 查看当前已创建的 Snell 用户
 ./Snell.sh admin-info    # 再次输出管理端口与令牌
