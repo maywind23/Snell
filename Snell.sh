@@ -63,6 +63,14 @@ random_psk() {
     openssl rand -base64 24 | tr -d '\n'
 }
 
+validate_port() {
+    local port="$1"
+    if [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)); then
+        return 0
+    fi
+    return 1
+}
+
 read_config_value() {
     local key="$1"
     [[ -f "$ADMIN_CONFIG" ]] || return 1
@@ -173,7 +181,14 @@ SERVICE
 }
 
 setup_admin_service() {
+    local desired_port="${1:-}"
     local admin_port admin_token server_host
+    if [[ -n "$desired_port" ]]; then
+        if ! validate_port "$desired_port"; then
+            log_error "Invalid admin port: $desired_port"
+            exit 1
+        fi
+    fi
     if [[ -f "$ADMIN_CONFIG" ]]; then
         # shellcheck disable=SC1090
         source "$ADMIN_CONFIG"
@@ -184,6 +199,9 @@ setup_admin_service() {
         admin_port=$DEFAULT_ADMIN_PORT
         admin_token=$(random_token)
         server_host=$(hostname -I | awk '{print $1}')
+    fi
+    if [[ -n "$desired_port" ]]; then
+        admin_port="$desired_port"
     fi
     admin_port=${admin_port:-$DEFAULT_ADMIN_PORT}
     admin_token=${admin_token:-$(random_token)}
@@ -993,6 +1011,7 @@ ensure_tracking_chain() {
 }
 
 install_stack() {
+    local desired_port="${1:-}"
     require_root
     install_dependencies
     ensure_directories
@@ -1000,7 +1019,7 @@ install_stack() {
     download_snell
     setup_systemd_template
     ensure_tracking_chain
-    setup_admin_service
+    setup_admin_service "$desired_port"
     log_info "Snell server and web UI installation completed."
     log_info "Access the panel at http://<server_ip>:${ADMIN_PORT:-$DEFAULT_ADMIN_PORT}".
 }
@@ -1050,7 +1069,7 @@ cli_usage() {
 Usage: ./Snell.sh <command>
 
 Commands:
-  install          Install Snell server and web interface
+  install [--web-port <port>]  Install Snell server and web interface
   uninstall        Remove Snell server and all related files
   list-users       List configured Snell users
   admin-info       Show admin panel access information
@@ -1059,9 +1078,29 @@ USAGE
 
 main() {
     local cmd="${1:-}"
+    if [[ $# -gt 0 ]]; then
+        shift
+    fi
     case "$cmd" in
         install)
-            install_stack
+            local desired_port=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --web-port|--admin-port)
+                        if [[ $# -lt 2 ]]; then
+                            log_error "Option $1 requires a port value"
+                            exit 1
+                        fi
+                        desired_port="$2"
+                        shift 2
+                        ;;
+                    *)
+                        log_error "Unknown option for install: $1"
+                        exit 1
+                        ;;
+                esac
+            done
+            install_stack "$desired_port"
             ;;
         uninstall)
             uninstall_stack
