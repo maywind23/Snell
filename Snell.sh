@@ -1,1740 +1,1081 @@
 #!/usr/bin/env bash
-PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
-export PATH
+set -euo pipefail
 
-#=================================================
-#	System Required: CentOS/Debian/Ubuntu
-#	Description: Snell Server 管理脚本
-#	Author: 翠花
-#	WebSite: https://about.nange.cn
-#=================================================
+SNELL_VERSION="v5.1.0"
+SNELL_BASE_URL="https://github.com/surge-networks/snell/releases/download"
+BASE_DIR="/etc/snell"
+USER_DIR="$BASE_DIR/users"
+DB_FILE="$BASE_DIR/users.json"
+ADMIN_DIR="/opt/snell-admin"
+WEB_DIR="$ADMIN_DIR/web"
+CGI_DIR="$WEB_DIR/cgi-bin"
+ADMIN_CONFIG="$BASE_DIR/admin.conf"
+SNELL_BIN="/usr/local/bin/snell-server"
+SYSTEMD_TEMPLATE="/etc/systemd/system/snell-server@.service"
+HTTPD_SERVICE="/etc/systemd/system/snell-admin.service"
+TRACK_CHAIN="SNELL-TRACK"
+DEFAULT_ADMIN_PORT=6180
 
-sh_ver="1.8.4"
-snell_v2_version="2.0.6"
-snell_v3_version="3.0.1"
-snell_v4_version="4.1.1"
-snell_v5_version="5.0.0"
-script_dir=$(cd "$(dirname "$0")"; pwd)
-script_path=$(echo -e "${script_dir}"|awk -F "$0" '{print $1}')
-snell_dir="/etc/snell/"
-snell_bin="/usr/local/bin/snell-server"
-snell_conf="/etc/snell/config.conf"
-snell_version_file="/etc/snell/ver.txt"
-sysctl_conf="/etc/sysctl.d/local.conf"
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;36m'
+NC='\033[0m'
 
-Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Red_background_prefix="\033[41;37m" && Font_color_suffix="\033[0m" && Yellow_font_prefix="\033[0;33m"
-Info="${Green_font_prefix}[信息]${Font_color_suffix}"
-Error="${Red_font_prefix}[错误]${Font_color_suffix}"
-Tip="${Yellow_font_prefix}[注意]${Font_color_suffix}"
-
-# 检查是否为 Root 用户
-checkRoot(){
-	[[ $EUID != 0 ]] && echo -e "${Error} 当前非ROOT账号(或没有ROOT权限)，无法继续操作，请更换ROOT账号或使用 ${Green_background_prefix}sudo su${Font_color_suffix} 命令获取临时ROOT权限（执行后可能会提示输入当前账号的密码）。" && exit 1
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
 }
 
-# 检查系统类型
-checkSys(){
-	if [[ -f /etc/redhat-release ]]; then
-		release="centos"
-	elif cat /etc/issue | grep -q -E -i "debian"; then
-		release="debian"
-	elif cat /etc/issue | grep -q -E -i "ubuntu"; then
-		release="ubuntu"
-	elif cat /etc/issue | grep -q -E -i "centos|red hat|redhat"; then
-		release="centos"
-	elif cat /proc/version | grep -q -E -i "debian"; then
-		release="debian"
-	elif cat /proc/version | grep -q -E -i "ubuntu"; then
-		release="ubuntu"
-	elif cat /proc/version | grep -q -E -i "centos|red hat|redhat"; then
-		release="centos"
+log_warn() {
+    echo -e "${BLUE}[WARN]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+require_root() {
+    if [[ $(id -u) -ne 0 ]]; then
+        log_error "This script must be run as root."
+        exit 1
     fi
 }
 
-# 检查依赖
-checkDependencies(){
-    local deps=("wget" "unzip" "ss")
-    for cmd in "${deps[@]}"; do
-        if ! command -v "$cmd" &> /dev/null; then
-            echo -e "${Error} 缺少依赖: $cmd，正在尝试安装..."
-            if [[ -f /etc/debian_version ]]; then
-                apt-get update && apt-get install -y "$cmd"
-            elif [[ -f /etc/redhat-release ]]; then
-                yum install -y "$cmd"
-            else
-                echo -e "${Error} 不支持的系统，无法自动安装 $cmd"
-                exit 1
-            fi
-        fi
-    done
-    echo -e "${Info} 依赖检查完成"
+ensure_directories() {
+    mkdir -p "$USER_DIR" "$CGI_DIR"
+    chmod 750 "$BASE_DIR"
 }
 
-# 安装依赖
-installDependencies(){
-	if [[ ${release} == "centos" ]]; then
-		yum update
-		yum install gzip wget curl unzip jq -y
-	else
-		apt-get update
-		apt-get install gzip wget curl unzip jq -y
-	fi
-	sysctl -w net.core.rmem_max=26214400
-	sysctl -w net.core.rmem_default=26214400
-	\cp -f /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-	echo -e "${Info} 依赖安装完成"
+ensure_db() {
+    if [[ ! -f "$DB_FILE" ]]; then
+        cat <<'JSON' >"$DB_FILE"
+{
+  "users": []
 }
-
-# 检查系统架构
-sysArch() {
-    uname=$(uname -m)
-    if [[ "$uname" == "i686" ]] || [[ "$uname" == "i386" ]]; then
-        arch="i386"
-    elif [[ "$uname" == *"armv7"* ]] || [[ "$uname" == "armv6l" ]]; then
-        arch="armv7l"
-    elif [[ "$uname" == *"armv8"* ]] || [[ "$uname" == "aarch64" ]]; then
-        arch="aarch64"
-    else
-        arch="amd64"
-    fi    
-}
-
-# 开启 TCP Fast Open
-enableTCPFastOpen() {
-	kernel=$(uname -r | awk -F . '{print $1}')
-	if [ "$kernel" -ge 3 ]; then
-		echo 3 >/proc/sys/net/ipv4/tcp_fastopen
-		[[ ! -e $sysctl_conf ]] && echo "fs.file-max = 51200
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.core.rmem_default = 65536
-net.core.wmem_default = 65536
-net.core.netdev_max_backlog = 4096
-net.core.somaxconn = 4096
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_tw_recycle = 0
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_keepalive_time = 1200
-net.ipv4.ip_local_port_range = 10000 65000
-net.ipv4.tcp_max_syn_backlog = 4096
-net.ipv4.tcp_max_tw_buckets = 5000
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_rmem = 4096 87380 67108864
-net.ipv4.tcp_wmem = 4096 65536 67108864
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_ecn=1
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control = bbr" >>/etc/sysctl.d/local.conf && sysctl --system >/dev/null 2>&1
-	else
-		echo -e "$Error 系统内核版本过低，无法支持 TCP Fast Open！"
-	fi
-}
-
-# 检查 Snell 是否安装
-checkInstalledStatus(){
-	[[ ! -e ${snell_bin} ]] && echo -e "${Error} Snell Server 没有安装，请检查！" && exit 1
-}
-
-# 检查 Snell 运行状态
-checkStatus(){
-    if systemctl is-active snell-server.service &> /dev/null; then
-        status="running"
-    else
-        status="stopped"
+JSON
     fi
 }
 
-# 版本号比较函数（优先正式版）
-compareVersions(){
-    local version1="$1"
-    local version2="$2"
-    
-    # 移除版本号前缀 v
-    version1=$(echo "$version1" | sed 's/^v//')
-    version2=$(echo "$version2" | sed 's/^v//')
-    
-    # 如果版本号完全相同
-    if [[ "$version1" == "$version2" ]]; then
-        return 1  # 相等
-    fi
-    
-    # 提取基础版本号（去除测试版后缀）
-    local base_version1=$(echo "$version1" | sed 's/[a-z].*//')
-    local base_version2=$(echo "$version2" | sed 's/[a-z].*//')
-    
-    # 检查是否为测试版
-    local is_beta1=false
-    local is_beta2=false
-    [[ "$version1" =~ [a-z] ]] && is_beta1=true
-    [[ "$version2" =~ [a-z] ]] && is_beta2=true
-    
-    # 如果基础版本号相同
-    if [[ "$base_version1" == "$base_version2" ]]; then
-        # 优先选择正式版
-        if [[ "$is_beta1" == true && "$is_beta2" == false ]]; then
-            return 2  # version1 < version2(正式版优先)
-        elif [[ "$is_beta1" == false && "$is_beta2" == true ]]; then
-            return 0  # version1 > version2(正式版优先)
-        fi
-        # 如果都是测试版或都是正式版，使用字母序比较
-        if [[ "$version1" < "$version2" ]]; then
-            return 2
-        else
-            return 0
-        fi
-    fi
-    
-    # 基础版本号不同时，使用 sort -V 进行版本号比较
-    if printf '%s\n' "$base_version1" "$base_version2" | sort -V | head -1 | grep -q "^$base_version1$"; then
-        return 2  # version1 < version2
-    else
-        return 0  # version1 > version2
-    fi
+random_token() {
+    openssl rand -hex 16
 }
 
-# 验证版本 URL 是否有效
-validateVersionUrl(){
-    local version="$1"
-    getSnellDownloadUrl "$version"
-    
-    # 使用 HEAD 请求检查 URL 是否有效
-    if curl -I -s --max-time 10 "$snell_url" | head -1 | grep -q "200 OK"; then
-        return 0  # URL 有效
-    else
-        return 1  # URL 无效
-    fi
+random_psk() {
+    openssl rand -base64 24 | tr -d '\n'
 }
 
-# 检查版本更新
-checkVersionUpdate(){
-    local show_info=${1:-false}  # 是否显示详细信息，默认为静默
-    update_available=false
-    current_installed_version=""
-    latest_available_version=""
-    best_version=""
-    
-    if [[ -e ${snell_bin} && -e ${snell_conf} ]]; then
-        current_ver=$(cat ${snell_conf}|grep 'version = '|awk -F 'version = ' '{print $NF}')
-        
-        # v2 和 v3 不支持版本检查，直接返回
-        if [[ "$current_ver" == "2" || "$current_ver" == "3" ]]; then
-            update_available=false
-            return 0
-        fi
-        
-        if [[ -e ${snell_version_file} ]]; then
-            installed_version=$(cat ${snell_version_file} | sed 's/^v//')
-            current_installed_version="$installed_version"
-            
-            # 根据当前版本确定对应的脚本版本和网页版本
-            case "$current_ver" in
-                "4")
-                    script_version=${snell_v4_version}
-                    web_version=$(getLatestVersionFromWeb "v4")
-                    ;;
-                "5")
-                    script_version=${snell_v5_version}
-                    web_version=$(getLatestVersionFromWeb "v5")
-                    ;;
-                *)
-                    script_version=""
-                    web_version=""
-                    ;;
-            esac
-            
-            # 优先使用脚本内置版本，除非网页版本更新
-            best_version="$installed_version"
-            version_source="已安装"
-            
-            # 首先比较脚本内置版本
-            if [[ -n "$script_version" ]]; then
-                compareVersions "$best_version" "$script_version"
-                case $? in
-                    2)  # best_version < script_version
-                        # 验证脚本内置版本的 URL 是否有效
-                        if validateVersionUrl "$script_version"; then
-                            best_version="$script_version"
-                            version_source="脚本内置"
-                        else
-                            [[ "$show_info" == true ]] && echo -e "${Tip} 脚本内置版本 v${script_version} 的下载链接无效，跳过"
-                        fi
-                        ;;
-                esac
-            fi
-            
-            # 然后比较网页版本，只有当网页版本比当前最佳版本更新时才采用
-            if [[ -n "$web_version" ]]; then
-                compareVersions "$best_version" "$web_version"
-                case $? in
-                    2)  # best_version < web_version
-                        # 验证网页版本的 URL 是否有效
-                        if validateVersionUrl "$web_version"; then
-                            best_version="$web_version"
-                            version_source="官方网页"
-                        else
-                            [[ "$show_info" == true ]] && echo -e "${Tip} 网页版本 v${web_version} 的下载链接无效，使用脚本内置版本"
-                        fi
-                        ;;
-                    1|0)  # best_version >= web_version
-                        # 脚本内置版本优先，无需显示
-                        ;;
-                esac
-            fi
-            
-            latest_available_version="$best_version"
-            
-            # 如果最佳版本与当前安装版本不同，则有更新可用
-            compareVersions "$installed_version" "$best_version"
-            if [[ $? -eq 2 ]]; then
-                update_available=true
-                if [[ "$show_info" == true ]]; then
-                    echo -e "${Info} 发现更新：当前版本 v${installed_version} -> 最新版本 v${best_version}"
-                    echo -e "${Info} 更新版本来源：${version_source}"
-                fi
-            fi
-        fi
-    fi
+read_config_value() {
+    local key="$1"
+    [[ -f "$ADMIN_CONFIG" ]] || return 1
+    # shellcheck disable=SC1090
+    source "$ADMIN_CONFIG"
+    local var="${key}"
+    printf '%s' "${!var}"
 }
 
-
-# 获取 Snell 下载链接
-getSnellDownloadUrl(){
-	sysArch
-	local version=$1
-	snell_url="https://dl.nssurge.com/snell/snell-server-v${version}-linux-${arch}.zip"
-}
-
-
-
-# 下载并安装 Snell v2（备用源）
-# 下载并安装 Snell v2（GitHub 备份源）
-downloadSnellV2() {
-    downloadSnellFromGitHub "${snell_v2_version}" "v2 GitHub备份源版"
-}
-
-# 下载并安装 Snell v3（GitHub 备份源）
-downloadSnellV3() {
-    downloadSnellFromGitHub "${snell_v3_version}" "v3 GitHub备份源版"
-}
-
-# 通用下载并安装 Snell 函数（GitHub 备份源）
-downloadSnellFromGitHub(){
-    local version=$1
-    local version_type=$2
-    
-    echo -e "${Info} 试图请求 ${Yellow_font_prefix}${version_type}${Font_color_suffix} Snell Server ……"
-    
-    local backup_url="https://raw.githubusercontent.com/xOS/Others/master/snell/v${version}/snell-server-v${version}-linux-${arch}.zip"
-    
-    wget --no-check-certificate -N "${backup_url}"
-    if [[ ! -e "snell-server-v${version}-linux-${arch}.zip" ]]; then
-        echo -e "${Error} Snell Server ${Yellow_font_prefix}${version_type}${Font_color_suffix} 下载失败！"
-        return 1
-    fi
-    
-    unzip -o "snell-server-v${version}-linux-${arch}.zip"
-    if [[ ! -e "snell-server" ]]; then
-        echo -e "${Error} Snell Server ${Yellow_font_prefix}${version_type}${Font_color_suffix} 解压失败！"
-        return 1
-    fi
-    
-    rm -rf "snell-server-v${version}-linux-${arch}.zip"
-    chmod +x snell-server
-    mv -f snell-server "${snell_bin}"
-    echo "v${version}" > "${snell_version_file}"
-    echo -e "${Info} Snell Server 主程序下载安装完毕！"
-    return 0
-}
-
-# 下载并安装 Snell v4（官方源）
-downloadSnellV4(){
-	downloadSnell "${snell_v4_version}" "v4 官网源版"
-}
-
-# 下载并安装 Snell v5（官方源）
-downloadSnellV5(){
-	downloadSnell "${snell_v5_version}" "v5 官网源版"
-}
-
-# 通用下载并安装 Snell 函数（带回退机制）
-downloadSnell(){
-	local version=$1
-	local version_type=$2
-	local allow_fallback=${3:-false}
-	local fallback_version=$4
-	
-	echo -e "${Info} 试图请求 ${Yellow_font_prefix}${version_type}${Font_color_suffix} Snell Server ……"
-	getSnellDownloadUrl "${version}"
-	
-	# 首先检查 URL 是否有效
-	if ! curl -I -s --max-time 10 "$snell_url" | head -1 | grep -q "200 OK"; then
-		echo -e "${Error} Snell Server ${Yellow_font_prefix}${version_type}${Font_color_suffix} 下载链接无效 (404)！"
-		
-		# 如果允许回退且提供了回退版本
-		if [[ "$allow_fallback" == true && -n "$fallback_version" ]]; then
-			echo -e "${Info} 尝试回退到已安装版本 v${fallback_version}..."
-			getSnellDownloadUrl "${fallback_version}"
-			if curl -I -s --max-time 10 "$snell_url" | head -1 | grep -q "200 OK"; then
-				version="$fallback_version"
-				echo -e "${Info} 回退成功，使用版本 v${version}"
-			else
-				echo -e "${Error} 回退版本也无法下载！"
-				return 1
-			fi
-		else
-			return 1
-		fi
-	fi
-	
-	wget --no-check-certificate -N "${snell_url}"
-	if [[ ! -e "snell-server-v${version}-linux-${arch}.zip" ]]; then
-		echo -e "${Error} Snell Server ${Yellow_font_prefix}${version_type}${Font_color_suffix} 下载失败！"
-		return 1 && exit 1
-	else
-		unzip -o "snell-server-v${version}-linux-${arch}.zip"
-	fi
-	if [[ ! -e "snell-server" ]]; then
-		echo -e "${Error} Snell Server ${Yellow_font_prefix}${version_type}${Font_color_suffix} 解压失败！"
-		return 1 && exit 1
-	else
-		rm -rf "snell-server-v${version}-linux-${arch}.zip"
-		chmod +x snell-server
-		mv -f snell-server "${snell_bin}"
-		echo "v${version}" > ${snell_version_file}
-		echo -e "${Info} Snell Server 主程序下载安装完毕！"
-		return 0
-	fi
-}
-
-# 安装 Snell
-installSnell() {
-	if [[ ! -e "${snell_dir}" ]]; then
-		mkdir "${snell_dir}"
-	else
-		[[ -e "${snell_bin}" ]] && rm -rf "${snell_bin}"
-	fi
-	echo -e "选择安装版本${Yellow_font_prefix}[2-5]${Font_color_suffix} 
-==================================
-${Green_font_prefix} 2.${Font_color_suffix} v2  ${Green_font_prefix} 3.${Font_color_suffix} v3  ${Green_font_prefix} 4.${Font_color_suffix} v4  ${Green_font_prefix} 5.${Font_color_suffix} v5
-=================================="
-	read -e -p "(默认：4.v4)：" ver
-	[[ -z "${ver}" ]] && ver="4"
-	if [[ ${ver} == "2" ]]; then
-		installSnellV2
-	elif [[ ${ver} == "3" ]]; then
-		installSnellV3
-	elif [[ ${ver} == "4" ]]; then
-		installSnellV4
-	elif [[ ${ver} == "5" ]]; then
-		installSnellV5
-	else
-		installSnellV4
-	fi
-}
-
-# 配置服务
-setupService(){
-	echo '
-[Unit]
-Description=Snell Service
-After=network-online.target
-Wants=network-online.target systemd-networkd-wait-online.service
-[Service]
-LimitNOFILE=32767 
-Type=simple
-User=root
-Restart=on-failure
-RestartSec=5s
-ExecStartPre=/bin/sh -c 'ulimit -n 51200'
-ExecStart=/usr/local/bin/snell-server -c /etc/snell/config.conf
-[Install]
-WantedBy=multi-user.target' > /etc/systemd/system/snell-server.service
-	systemctl enable --now snell-server
-	echo -e "${Info} Snell Server 服务配置完成！"
-}
-
-# 写入配置文件
-writeConfig(){
-    if [[ -f "${snell_conf}" ]]; then
-        cp "${snell_conf}" "${snell_conf}.bak.$(date +%Y%m%d_%H%M%S)"
-        echo -e "${Info} 已备份旧配置文件到 ${snell_conf}.bak"
-    fi
-    cat > "${snell_conf}" << EOF
-[snell-server]
-listen = ::0:${port}
-ipv6 = ${ipv6}
-psk = ${psk}
-obfs = ${obfs}
-$(if [[ ${obfs} != "off" ]]; then echo "obfs-host = ${host}"; fi)
-tfo = ${tfo}
-dns = ${dns}
-version = ${ver}
+write_admin_config() {
+    local admin_port="$1"
+    local admin_token="$2"
+    local server_host="$3"
+    cat <<EOF >"$ADMIN_CONFIG"
+ADMIN_PORT=${admin_port}
+ADMIN_TOKEN=${admin_token}
+SERVER_HOST=${server_host}
 EOF
 }
 
-
-
-
-# 读取配置文件
-readConfig(){
-	[[ ! -e ${snell_conf} ]] && echo -e "${Error} Snell Server 配置文件不存在！" && exit 1
-	ipv6=$(cat ${snell_conf}|grep 'ipv6 = '|awk -F 'ipv6 = ' '{print $NF}')
-	port=$(grep -E '^listen\s*=' ${snell_conf} | awk -F ':' '{print $NF}' | xargs)
-	psk=$(cat ${snell_conf}|grep 'psk = '|awk -F 'psk = ' '{print $NF}')
-	obfs=$(cat ${snell_conf}|grep 'obfs = '|awk -F 'obfs = ' '{print $NF}')
-	host=$(cat ${snell_conf}|grep 'obfs-host = '|awk -F 'obfs-host = ' '{print $NF}')
-	tfo=$(cat ${snell_conf}|grep 'tfo = '|awk -F 'tfo = ' '{print $NF}')
-	dns=$(cat ${snell_conf}|grep 'dns = '|awk -F 'dns = ' '{print $NF}')
-	ver=$(cat ${snell_conf}|grep 'version = '|awk -F 'version = ' '{print $NF}')
-}
-
-# 设置端口
-setPort(){
-    while true; do
-        echo -e "${Tip} 本步骤不涉及系统防火墙端口操作，请手动放行相应端口！"
-        echo -e "请输入 Snell Server 端口${Yellow_font_prefix}[1-65535]${Font_color_suffix}"
-        read -e -p "(默认: 2345):" port
-        [[ -z "${port}" ]] && port="2345"
-        if [[ $port =~ ^[0-9]+$ ]] && [[ $port -ge 1 && $port -le 65535 ]]; then
-            if ss -tuln | grep -q ":$port "; then
-                echo -e "${Error} 端口 $port 已被占用，请选择其他端口。"
-            else
-                echo && echo "=============================="
-                echo -e "端口 : ${Red_background_prefix} ${port} ${Font_color_suffix}"
-                echo "==============================" && echo
-                break
-            fi
-        else
-            echo "输入错误, 请输入正确的端口号。"
-			sleep 2s
-			setPort
-        fi
-    done
-}
-
-
-# 设置 IPv6
-setIpv6(){
-	echo -e "是否开启 IPv6 解析？
-==================================
-${Green_font_prefix} 1.${Font_color_suffix} 开启  ${Green_font_prefix} 2.${Font_color_suffix} 关闭
-=================================="
-	read -e -p "(默认：2.关闭)：" ipv6
-	[[ -z "${ipv6}" ]] && ipv6="false"
-	if [[ ${ipv6} == "1" ]]; then
-		ipv6=true
-	else
-		ipv6=false
-	fi
-	echo && echo "=================================="
-	echo -e "IPv6 解析 开启状态：${Red_background_prefix} ${ipv6} ${Font_color_suffix}"
-	echo "==================================" && echo
-}
-
-# 设置密钥
-setPSK(){
-	echo "请输入 Snell Server 密钥 [0-9][a-z][A-Z] "
-	read -e -p "(默认: 随机生成):" psk
-	[[ -z "${psk}" ]] && psk=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)
-	echo && echo "=============================="
-	echo -e "密钥 : ${Red_background_prefix} ${psk} ${Font_color_suffix}"
-	echo "==============================" && echo
-}
-
-# 设置 OBFS
-setObfs(){
-    echo -e "配置 OBFS，${Tip} 无特殊作用不建议启用该项。
-==================================
-${Green_font_prefix} 1.${Font_color_suffix} TLS  ${Green_font_prefix} 2.${Font_color_suffix} HTTP ${Green_font_prefix} 3.${Font_color_suffix} 关闭
-=================================="
-    read -e -p "(默认：3.关闭)：" obfs
-    [[ -z "${obfs}" ]] && obfs="3"
-    if [[ ${obfs} == "1" ]]; then
-        obfs="tls"
-        setHost  # 强制设置 OBFS 域名
-    elif [[ ${obfs} == "2" ]]; then
-        obfs="http"
-        setHost  # 强制设置 OBFS 域名
-    elif [[ ${obfs} == "3" ]]; then
-        obfs="off"
-        host=""  # 清空 host
+package_manager() {
+    if command -v apt >/dev/null 2>&1; then
+        echo "apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        echo "yum"
     else
-        obfs="off"
-        host=""  # 清空 host
-    fi
-    echo && echo "=================================="
-    echo -e "OBFS 状态：${Red_background_prefix} ${obfs} ${Font_color_suffix}"
-    if [[ ${obfs} != "off" ]]; then
-        echo -e "OBFS 域名：${Red_background_prefix} ${host} ${Font_color_suffix}"
-    fi
-    echo "==================================" && echo
-}
-
-
-# 设置协议版本
-setVer(){
-	echo -e "配置 Snell Server 协议版本${Yellow_font_prefix}[2-5]${Font_color_suffix} 
-==================================
-${Green_font_prefix} 2.${Font_color_suffix} v2 ${Green_font_prefix} 3.${Font_color_suffix} v3 ${Green_font_prefix} 4.${Font_color_suffix} v4 ${Green_font_prefix} 5.${Font_color_suffix} v5
-=================================="
-	read -e -p "(默认：4.v4)：" ver
-	[[ -z "${ver}" ]] && ver="4"
-	if [[ ${ver} == "2" ]]; then
-		ver=2
-	elif [[ ${ver} == "3" ]]; then
-		ver=3
-	elif [[ ${ver} == "4" ]]; then
-		ver=4
-	elif [[ ${ver} == "5" ]]; then
-		ver=5
-	else
-		ver=4
-	fi
-	echo && echo "=================================="
-	echo -e "Snell Server 协议版本：${Red_background_prefix} ${ver} ${Font_color_suffix}"
-	echo "==================================" && echo
-}
-
-# 设置 OBFS 域名
-setHost(){
-	echo "请输入 Snell Server 域名，v4 版本及以上如无特别需求可忽略。"
-	read -e -p "(默认: icloud.com):" host
-	[[ -z "${host}" ]] && host=icloud.com
-	echo && echo "=============================="
-	echo -e "域名 : ${Red_background_prefix} ${host} ${Font_color_suffix}"
-	echo "==============================" && echo
-}
-
-# 设置 TCP Fast Open
-setTFO(){
-	echo -e "是否开启 TCP Fast Open？
-==================================
-${Green_font_prefix} 1.${Font_color_suffix} 开启  ${Green_font_prefix} 2.${Font_color_suffix} 关闭
-=================================="
-	read -e -p "(默认：1.开启)：" tfo
-	[[ -z "${tfo}" ]] && tfo="1"
-	if [[ ${tfo} == "1" ]]; then
-		tfo=true
-		enableTCPFastOpen
-	else
-		tfo=false
-	fi
-	echo && echo "=================================="
-	echo -e "TCP Fast Open 开启状态：${Red_background_prefix} ${tfo} ${Font_color_suffix}"
-	echo "==================================" && echo
-}
-
-# 设置 DNS
-setDNS(){
-	echo -e "${Tip} 请输入正确格式的 DNS，多条记录以英文逗号隔开，仅支持 v4.1.0b1 版本及以上。"
-	read -e -p "(默认值：1.1.1.1, 8.8.8.8, 2001:4860:4860::8888)：" dns
-	[[ -z "${dns}" ]] && dns="1.1.1.1, 8.8.8.8, 2001:4860:4860::8888"
-	echo && echo "=================================="
-	echo -e "当前 DNS 为：${Red_background_prefix} ${dns} ${Font_color_suffix}"
-	echo "==================================" && echo
-}
-
-# 修改配置
-setConfig(){
-    checkInstalledStatus
-    echo && echo -e "请输入要操作配置项的序号，然后回车
-==============================
- ${Green_font_prefix}1.${Font_color_suffix} 修改 端口
- ${Green_font_prefix}2.${Font_color_suffix} 修改 密钥
- ${Green_font_prefix}3.${Font_color_suffix} 配置 OBFS
- ${Green_font_prefix}4.${Font_color_suffix} 配置 OBFS 域名
- ${Green_font_prefix}5.${Font_color_suffix} 开关 IPv6 解析
- ${Green_font_prefix}6.${Font_color_suffix} 开关 TCP Fast Open
- ${Green_font_prefix}7.${Font_color_suffix} 配置 DNS
- ${Green_font_prefix}8.${Font_color_suffix} 配置 Snell Server 协议版本
-==============================
- ${Green_font_prefix}9.${Font_color_suffix} 修改 全部配置" && echo
-    read -e -p "(默认: 取消):" modify
-    [[ -z "${modify}" ]] && echo "已取消..." && exit 1
-    if [[ "${modify}" == "1" ]]; then
-        readConfig
-        setPort
-        writeConfig
-        restartSnell
-    elif [[ "${modify}" == "2" ]]; then
-        readConfig
-        setPSK
-        writeConfig
-        restartSnell
-    elif [[ "${modify}" == "3" ]]; then
-        readConfig
-        setObfs  # 在 setObfs 中已处理 host
-        writeConfig
-        restartSnell
-    elif [[ "${modify}" == "4" ]]; then
-        readConfig
-        if [[ ${obfs} == "off" ]]; then
-            echo -e "${Error} OBFS 当前为 off，无法修改 OBFS 域名。"
-        else
-            setHost
-            writeConfig
-            restartSnell
-        fi
-    elif [[ "${modify}" == "5" ]]; then
-        readConfig
-        setIpv6
-        writeConfig
-        restartSnell
-    elif [[ "${modify}" == "6" ]]; then
-        readConfig
-        setTFO
-        writeConfig
-        restartSnell
-    elif [[ "${modify}" == "7" ]]; then
-        readConfig
-        setDNS
-        writeConfig
-        restartSnell
-    elif [[ "${modify}" == "8" ]]; then
-        readConfig
-        setVer
-        writeConfig
-        restartSnell
-    elif [[ "${modify}" == "9" ]]; then
-        setPort
-        setPSK
-        setObfs  # 在 setObfs 中已处理 host
-        setIpv6
-        setTFO
-        setDNS
-        setVer
-        writeConfig
-        restartSnell
-    else
-        echo -e "${Error} 请输入正确数字${Yellow_font_prefix}[1-9]${Font_color_suffix}"
-        sleep 2s
-        setConfig
-    fi
-    sleep 3s
-    startMenu
-}
-
-
-# 安装 Snell v2
-installSnellV2(){
-	checkRoot
-	[[ -e ${snell_bin} ]] && echo -e "${Error} 检测到 Snell Server 已安装！" && exit 1
-	echo -e "${Info} 开始设置 配置..."
-	setPort
-	setPSK
-	setObfs
-	setIpv6
-	setTFO
-	echo -e "${Info} 开始安装/配置 依赖..."
-	checkDependencies
-	installDependencies
-	echo -e "${Info} 开始下载/安装..."
-	downloadSnellV2
-	echo -e "${Info} 开始安装 服务脚本..."
-	setupService
-	echo -e "${Info} 开始写入 配置文件..."
-	writeConfig
-	echo -e "${Info} 所有步骤 安装完毕，开始启动..."
-	startSnell
-	echo -e "${Info} 启动完成，查看配置..."
-    viewConfig
-}
-
-# 安装 Snell v3
-installSnellV3(){
-	checkRoot
-	[[ -e ${snell_bin} ]] && echo -e "${Error} 检测到 Snell Server 已安装！" && exit 1
-	echo -e "${Info} 开始设置 配置..."
-	setPort
-	setPSK
-	setObfs
-	setIpv6
-	setTFO
-	echo -e "${Info} 开始安装/配置 依赖..."
-	checkDependencies
-	installDependencies
-	echo -e "${Info} 开始下载/安装..."
-	downloadSnellV3
-	echo -e "${Info} 开始安装 服务脚本..."
-	setupService
-	echo -e "${Info} 开始写入 配置文件..."
-	writeConfig
-	echo -e "${Info} 所有步骤 安装完毕，开始启动..."
-	startSnell
-	echo -e "${Info} 启动完成，查看配置..."
-    viewConfig
-}
-
-# 安装 Snell v4
-installSnellV4(){
-	checkRoot
-	[[ -e ${snell_bin} ]] && echo -e "${Error} 检测到 Snell Server 已安装，请先卸载旧版再安装新版!" && exit 1
-	echo -e "${Info} 开始设置 配置..."
-	setPort
-	setPSK
-	setObfs
-	setIpv6
-	setTFO
-	setDNS
-	echo -e "${Info} 开始安装/配置 依赖..."
-	checkDependencies
-	installDependencies
-	echo -e "${Info} 开始下载/安装..."
-	downloadSnellV4
-	echo -e "${Info} 开始安装 服务脚本..."
-	setupService
-	echo -e "${Info} 开始写入 配置文件..."
-	writeConfig
-	echo -e "${Info} 所有步骤 安装完毕，开始启动..."
-	startSnell
-	echo -e "${Info} 启动完成，查看配置..."
-    viewConfig
-}
-
-# 安装 Snell v5
-installSnellV5(){
-	checkRoot
-	[[ -e ${snell_bin} ]] && echo -e "${Error} 检测到 Snell Server 已安装，请先卸载旧版再安装新版!" && exit 1
-	echo -e "${Info} 开始设置 配置..."
-	setPort
-	setPSK
-	setObfs
-	setIpv6
-	setTFO
-	setDNS
-	echo -e "${Info} 开始安装/配置 依赖..."
-	checkDependencies
-	installDependencies
-	echo -e "${Info} 开始下载/安装..."
-	downloadSnellV5
-	echo -e "${Info} 开始安装 服务脚本..."
-	setupService
-	echo -e "${Info} 开始写入 配置文件..."
-	writeConfig
-	echo -e "${Info} 所有步骤 安装完毕，开始启动..."
-	startSnell
-	echo -e "${Info} 启动完成，查看配置..."
-    viewConfig
-}
-
-# 启动 Snell
-startSnell(){
-    checkInstalledStatus
-    checkStatus
-    if [[ "$status" == "running" ]]; then
-        echo -e "${Info} Snell Server 已在运行！"
-    else
-        systemctl start snell-server
-        checkStatus
-        if [[ "$status" == "running" ]]; then
-            echo -e "${Info} Snell Server 启动成功！"
-        else
-            echo -e "${Error} Snell Server 启动失败！"
-            exit 1
-        fi
+        log_error "Unsupported distribution."
+        exit 1
     fi
 }
 
-# 停止 Snell
-stopSnell(){
-	checkInstalledStatus
-	checkStatus
-	[[ !"$status" == "running" ]] && echo -e "${Error} Snell Server 没有运行，请检查！" && exit 1
-	systemctl stop snell-server
-	echo -e "${Info} Snell Server 停止成功！"
-    sleep 3s
-    startMenu
-}
-
-# 重启 Snell
-restartSnell(){
-	checkInstalledStatus
-	systemctl restart snell-server
-	echo -e "${Info} Snell Server 重启完毕!"
-	sleep 3s
-    startMenu
-}
-
-# 更新 Snell（占位，待实现）
-updateSnell(){
-	checkInstalledStatus
-	echo -e "${Info} Snell Server 更新完毕！"
-    sleep 3s
-    startMenu
-}
-
-# v4 更新到 v5
-updateV4toV5(){
-	checkInstalledStatus
-	readConfig
-	
-	# 检查当前版本是否为 v4
-	if [[ "$ver" != "4" ]]; then
-		echo -e "${Error} 当前版本不是 v4，无法使用此功能！当前版本：v${ver}"
-		sleep 3s
-		startMenu
-		return 1
-	fi
-	
-	echo -e "${Info} 即将将 Snell Server 从 v4 更新到 v5 版本"
-	echo -e "确定要更新吗？(y/N)"
-	read -e -p "(默认: n):" confirm
-	[[ -z "${confirm}" ]] && confirm="n"
-	
-	if [[ ${confirm} != [Yy] ]]; then
-		echo -e "${Info} 已取消更新"
-		sleep 2s
-		startMenu
-		return 0
-	fi
-	
-	echo -e "${Info} 开始更新 Snell Server v4 到 v5..."
-	
-	# 停止服务
-	echo -e "${Info} 停止 Snell Server 服务..."
-	systemctl stop snell-server
-	
-	# 备份当前二进制文件
-	if [[ -e "${snell_bin}" ]]; then
-		echo -e "${Info} 备份当前程序文件..."
-		cp "${snell_bin}" "${snell_bin}.v4.backup.$(date +%Y%m%d_%H%M%S)"
-	fi
-	
-	# 获取当前安装的 v4 版本作为回退版本
-	current_v4_version=$(cat ${snell_version_file} | sed 's/^v//')
-	
-	# 获取最新的 v5 版本号（优先使用网页版本，然后是脚本内置版本）
-	web_v5_version=$(getLatestVersionFromWeb "v5")
-	script_v5_version="${snell_v5_version}"
-	
-	# 选择最新的 v5 版本
-	target_v5_version=""
-	if [[ -n "$web_v5_version" ]]; then
-		if validateVersionUrl "$web_v5_version"; then
-			target_v5_version="$web_v5_version"
-			echo -e "${Info} 使用网页获取的 v5 版本: v${target_v5_version}"
-		fi
-	fi
-	
-	# 如果网页版本无效，尝试脚本内置版本
-	if [[ -z "$target_v5_version" && -n "$script_v5_version" ]]; then
-		if validateVersionUrl "$script_v5_version"; then
-			target_v5_version="$script_v5_version"
-			echo -e "${Info} 使用脚本内置的 v5 版本: v${target_v5_version}"
-		fi
-	fi
-	
-	# 如果都无效，取消更新
-	if [[ -z "$target_v5_version" ]]; then
-		echo -e "${Error} 无法找到有效的 v5 版本进行更新"
-		systemctl start snell-server
-		sleep 3s
-		startMenu
-		return 1
-	fi
-	
-	# 下载并安装 v5，启用回退机制
-	echo -e "${Info} 开始下载 v5 版本..."
-	downloadSnell "${target_v5_version}" "v5 版本" true "${current_v4_version}"
-	
-	if [[ $? -eq 0 ]]; then
-		# 更新配置文件中的版本号
-		echo -e "${Info} 更新配置文件版本号..."
-		sed -i "s/version = 4/version = 5/g" "${snell_conf}"
-		
-		# 重新加载 systemd 并启动服务
-		echo -e "${Info} 重启 Snell Server 服务..."
-		systemctl daemon-reload
-		systemctl start snell-server
-		
-		# 检查服务状态
-		sleep 2
-		checkStatus
-		if [[ "$status" == "running" ]]; then
-			actual_version=$(cat ${snell_version_file} | sed 's/^v//')
-			echo -e "${Info} v4 到 v5 更新成功！"
-			echo -e "${Info} 当前版本：v${actual_version}"
-			
-			# 如果实际版本是 v4（说明回退了），更新配置文件版本号
-			if [[ "$actual_version" =~ ^4\. ]]; then
-				sed -i "s/version = 5/version = 4/g" "${snell_conf}"
-				echo -e "${Tip} 注意：由于下载链接问题，已回退到 v4 版本"
-			fi
-		else
-			echo -e "${Error} 服务启动失败，正在回滚..."
-			# 回滚到 v4
-			backup_file=$(ls -t "${snell_bin}".v4.backup.* 2>/dev/null | head -1)
-			if [[ -n "$backup_file" && -e "$backup_file" ]]; then
-				cp "$backup_file" "${snell_bin}"
-				echo "v${current_v4_version}" > ${snell_version_file}
-				sed -i "s/version = 5/version = 4/g" "${snell_conf}"
-				systemctl start snell-server
-				echo -e "${Info} 已回滚到 v4 版本"
-			fi
-		fi
-	else
-		echo -e "${Error} v5 下载失败，保持 v4 版本"
-		systemctl start snell-server
-	fi
-	
-	sleep 3s
-	startMenu
-}
-
-# 更新 Snell Server 到最新版本
-updateSnellServer(){
-    checkInstalledStatus
-    readConfig
-    
-    echo -e "${Info} 准备更新 Snell Server..."
-    
-    # 显示详细的版本检查信息
-    echo -e "${Info} 正在检查版本信息..."
-    updateBuiltinVersions true
-    checkVersionUpdate true
-    
-    # 检查是否有更新可用
-    force_checked=false
-    if [[ "$update_available" != true ]]; then
-        echo -e "${Info} 当前已是最新版本，无需更新！"
-        echo -e "${Info} 当前版本: ${Green_font_prefix}v${current_installed_version}${Font_color_suffix}"
-        echo
-        echo -e "${Tip} 是否要强制重新检查最新版本？(y/N)"
-        read -e -p "(默认: n):" force_check
-        [[ -z "${force_check}" ]] && force_check="n"
-        
-        if [[ ${force_check} == [Yy] ]]; then
-            echo -e "${Info} 强制重新检查最新版本..."
-            # 清除缓存并重新检查
-            rm -f /tmp/snell_version_cache
-            updateBuiltinVersions true
-            checkVersionUpdate true
-            force_checked=true
-            
-            # 重新检查后如果有更新，继续更新流程
-            if [[ "$update_available" == true ]]; then
-                echo -e "${Info} 检测到新版本，继续更新流程..."
-            else
-                echo -e "${Info} 重新检查后仍为最新版本"
-                sleep 3s
-                startMenu
-                return 0
-            fi
-        else
-            sleep 3s
-            startMenu
-            return 0
-        fi
+install_dependencies() {
+    local pkgs=(curl jq unzip openssl iptables)
+    if ! command -v busybox >/dev/null 2>&1; then
+        pkgs+=(busybox)
     fi
-    
-    # 显示版本信息
-    echo -e "${Info} 当前版本: ${Yellow_font_prefix}v${current_installed_version}${Font_color_suffix}"
-    echo -e "${Info} 最新版本: ${Green_font_prefix}v${latest_available_version}${Font_color_suffix}"
-    echo -e "确定要更新吗？(Y/n)"
-    read -e -p "(默认: y):" confirm
-    [[ -z "${confirm}" ]] && confirm="y"
-    
-    if [[ ${confirm} == [Nn] ]]; then
-        echo -e "${Info} 已取消更新"
-        sleep 2s
-        startMenu
-        return 0
-    fi
-    
-    echo -e "${Info} 开始更新 Snell Server 到最新版本..."
-    
-    # 停止服务
-    echo -e "${Info} 停止 Snell Server 服务..."
-    systemctl stop snell-server
-    
-    # 备份当前二进制文件
-    if [[ -e "${snell_bin}" ]]; then
-        echo -e "${Info} 备份当前程序文件..."
-        cp "${snell_bin}" "${snell_bin}.backup.$(date +%Y%m%d_%H%M%S)"
-    fi
-    
-    # 根据版本选择下载函数，启用回退机制
-    echo -e "${Info} 开始下载最新版本..."
-    case "$ver" in
-        "4")
-            downloadSnell "${latest_available_version}" "v4 最新版" true "${current_installed_version}"
+    local pm
+    pm=$(package_manager)
+    log_info "Installing dependencies (${pkgs[*]})..."
+    case "$pm" in
+        apt)
+            apt update
+            DEBIAN_FRONTEND=noninteractive apt install -y "${pkgs[@]}"
             ;;
-        "5")
-            downloadSnell "${latest_available_version}" "v5 最新版" true "${current_installed_version}"
+        dnf)
+            dnf install -y "${pkgs[@]}"
             ;;
-        *)
-            echo -e "${Error} 不支持的版本: v${ver}"
-            systemctl start snell-server
-            sleep 3s
-            startMenu
-            return 1
+        yum)
+            yum install -y "${pkgs[@]}"
             ;;
     esac
-    
-    if [[ $? -eq 0 ]]; then
-        # 重新加载 systemd 并启动服务
-        echo -e "${Info} 重启 Snell Server 服务..."
-        systemctl daemon-reload
-        systemctl start snell-server
-        
-        # 检查服务状态
-        sleep 2
-        checkStatus
-        if [[ "$status" == "running" ]]; then
-            actual_version=$(cat ${snell_version_file} | sed 's/^v//')
-            echo -e "${Info} Snell Server 更新成功！"
-            echo -e "${Info} 当前版本：v${actual_version}"
-            
-            # 如果实际更新版本与预期不同，给出提示
-            if [[ "$actual_version" != "$latest_available_version" ]]; then
-                echo -e "${Tip} 注意：由于下载链接问题，已回退到 v${actual_version} 版本"
-            fi
-        else
-            echo -e "${Error} 服务启动失败，正在回滚..."
-            # 回滚到备份版本
-            backup_file=$(ls -t "${snell_bin}".backup.* 2>/dev/null | head -1)
-            if [[ -n "$backup_file" && -e "$backup_file" ]]; then
-                cp "$backup_file" "${snell_bin}"
-                echo "v${current_installed_version}" > ${snell_version_file}
-                systemctl start snell-server
-                echo -e "${Info} 已回滚到备份版本 v${current_installed_version}"
-            fi
-        fi
+}
+
+detect_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)
+            echo "amd64"
+            ;;
+        aarch64|arm64)
+            echo "aarch64"
+            ;;
+        armv7l)
+            echo "armv7"
+            ;;
+        *)
+            log_error "Unsupported architecture: $arch"
+            exit 1
+            ;;
+    esac
+}
+
+download_snell() {
+    local arch
+    arch=$(detect_arch)
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local url="${SNELL_BASE_URL}/${SNELL_VERSION}/snell-server-${SNELL_VERSION}-linux-${arch}.zip"
+    log_info "Downloading Snell ${SNELL_VERSION} from ${url}"
+    curl -fsSL "$url" -o "$tmpdir/snell.zip"
+    unzip -o "$tmpdir/snell.zip" -d "$tmpdir"
+    install -m 755 "$tmpdir/snell-server" "$SNELL_BIN"
+    rm -rf "$tmpdir"
+}
+
+setup_systemd_template() {
+    if [[ -f "$SYSTEMD_TEMPLATE" ]]; then
+        return
+    fi
+    cat <<'SERVICE' >"$SYSTEMD_TEMPLATE"
+[Unit]
+Description=Snell Server instance %i
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/snell-server -c /etc/snell/users/%i.conf
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+    systemctl daemon-reload
+}
+
+setup_admin_service() {
+    local admin_port admin_token server_host
+    if [[ -f "$ADMIN_CONFIG" ]]; then
+        # shellcheck disable=SC1090
+        source "$ADMIN_CONFIG"
+        admin_port=${ADMIN_PORT:-$DEFAULT_ADMIN_PORT}
+        admin_token=${ADMIN_TOKEN:-$(random_token)}
+        server_host=${SERVER_HOST:-$(hostname -I | awk '{print $1}')}
     else
-        echo -e "${Error} 下载失败，启动原版本"
-        systemctl start snell-server
+        admin_port=$DEFAULT_ADMIN_PORT
+        admin_token=$(random_token)
+        server_host=$(hostname -I | awk '{print $1}')
     fi
-    
-    sleep 3s
-    startMenu
+    admin_port=${admin_port:-$DEFAULT_ADMIN_PORT}
+    admin_token=${admin_token:-$(random_token)}
+    server_host=${server_host:-$(hostname -I | awk '{print $1}')}
+    server_host=${server_host:-127.0.0.1}
+    write_admin_config "$admin_port" "$admin_token" "$server_host"
+    ADMIN_PORT=$admin_port
+    ADMIN_TOKEN=$admin_token
+
+    cat <<'CGI' >"$CGI_DIR/api.sh"
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_DIR="/etc/snell"
+USER_DIR="$BASE_DIR/users"
+DB_FILE="$BASE_DIR/users.json"
+ADMIN_CONFIG="$BASE_DIR/admin.conf"
+CHAIN="SNELL-TRACK"
+TMP_JSON="$(mktemp)"
+
+cleanup() {
+    rm -f "$TMP_JSON"
+}
+trap cleanup EXIT
+
+urldecode() {
+    local data="${1//+/ }"
+    printf '%b' "${data//%/\\x}"
 }
 
-# 自动获取 Snell 最新版本号
-getLatestVersionFromWeb(){
-    local version_type=$1
-    local release_page="https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell"
-    
-    page_content=$(curl -s -L --max-time 10 "$release_page" 2>/dev/null)
-    
-    if [[ -z "$page_content" ]]; then
-        return 1
-    fi
-    
-    if [[ "$version_type" == "v4" ]]; then
-        latest_v4=$(echo "$page_content" | grep -oE "snell-server-v4\.[0-9]+\.[0-9]+-linux" | head -1 | sed 's/snell-server-v//g' | sed 's/-linux//g')
-        if [[ -n "$latest_v4" ]]; then
-            echo "$latest_v4"
-            return 0
-        fi
-    elif [[ "$version_type" == "v5" ]]; then
-        latest_v5=$(echo "$page_content" | grep -oE "snell-server-v5\.[0-9]+\.[0-9]+[a-z]*[0-9]*-linux" | head -1 | sed 's/snell-server-v//g' | sed 's/-linux//g')
-        if [[ -n "$latest_v5" ]]; then
-            echo "$latest_v5"
-            return 0
-        fi
-    fi
-    
-    return 1
+load_config() {
+    # shellcheck disable=SC1090
+    source "$ADMIN_CONFIG"
+    ADMIN_PORT=${ADMIN_PORT:-6180}
+    ADMIN_TOKEN=${ADMIN_TOKEN:-}
+    SERVER_HOST=${SERVER_HOST:-$(hostname -I | awk '{print $1}')}
 }
 
-# 更新脚本内置版本号（带缓存机制，但保持脚本版本优先级）
-updateBuiltinVersions(){
-    local show_info=${1:-false}  # 是否显示详细信息，默认为静默
-    local cache_file="/tmp/snell_version_cache"
-    local cache_time=3600
-    local current_time=$(date +%s)
-    
-    # v2 和 v3 始终使用固定版本，无需检查
-    web_v2_newer=false
-    web_v3_newer=false
-    
-    # 检查缓存是否存在且有效
-    if [[ -f "$cache_file" ]]; then
-        local cache_timestamp=$(head -1 "$cache_file" 2>/dev/null)
-        if [[ -n "$cache_timestamp" && $((current_time - cache_timestamp)) -lt $cache_time ]]; then
-            local cached_v4=$(sed -n '2p' "$cache_file" 2>/dev/null)
-            local cached_v5=$(sed -n '3p' "$cache_file" 2>/dev/null)
-            if [[ -n "$cached_v4" && -n "$cached_v5" ]]; then
-                # 检查网页版本是否比脚本内置版本更新
-                compareVersions "${snell_v4_version}" "$cached_v4"
-                if [[ $? -eq 2 ]]; then
-                    web_v4_newer=true
-                else
-                    web_v4_newer=false
-                fi
-                
-                compareVersions "${snell_v5_version}" "$cached_v5"
-                if [[ $? -eq 2 ]]; then
-                    web_v5_newer=true
-                else
-                    web_v5_newer=false
-                fi
-                
-                return 0
-            fi
-        fi
+require_auth() {
+    if [[ -z "${HTTP_X_AUTH_TOKEN:-}" ]]; then
+        unauthorized
     fi
-    
-    [[ "$show_info" == true ]] && echo -e "${Info} 正在检查官方最新版本..."
-    
-    # 获取最新的 v4 版本
-    local latest_v4_web
-    latest_v4_web=$(getLatestVersionFromWeb "v4")
-    if [[ $? -eq 0 && -n "$latest_v4_web" ]]; then
-        # 比较网页版本和脚本内置版本
-        compareVersions "${snell_v4_version}" "$latest_v4_web"
-        if [[ $? -eq 2 ]]; then
-            web_v4_newer=true
-        else
-            web_v4_newer=false
-        fi
-    else
-        web_v4_newer=false
-        latest_v4_web="${snell_v4_version}"
-    fi
-    
-    # 获取最新的 v5 版本
-    local latest_v5_web
-    latest_v5_web=$(getLatestVersionFromWeb "v5")
-    if [[ $? -eq 0 && -n "$latest_v5_web" ]]; then
-        # 比较网页版本和脚本内置版本
-        compareVersions "${snell_v5_version}" "$latest_v5_web"
-        if [[ $? -eq 2 ]]; then
-            web_v5_newer=true
-        else
-            web_v5_newer=false
-        fi
-    else
-        web_v5_newer=false
-        latest_v5_web="${snell_v5_version}"
-    fi
-    
-    # 更新缓存（只缓存 v4 和 v5）
-    echo "$current_time" > "$cache_file"
-    echo "$latest_v4_web" >> "$cache_file"
-    echo "$latest_v5_web" >> "$cache_file"
-}
-
-# 强制检查最新版本（清除缓存）
-forceCheckVersions(){
-    echo -e "${Info} 强制检查 Snell 最新版本..."
-    
-    rm -f "/tmp/snell_version_cache"
-    updateBuiltinVersions true
-    
-    echo -e "${Info} 版本检查完成！"
-    echo -e "${Info} 脚本内置 v4 版本: ${Green_font_prefix}${snell_v4_version}${Font_color_suffix}"
-    echo -e "${Info} 脚本内置 v5 版本: ${Green_font_prefix}${snell_v5_version}${Font_color_suffix}"
-    
-    # 获取网页版本进行对比
-    web_v4=$(getLatestVersionFromWeb "v4")
-    web_v5=$(getLatestVersionFromWeb "v5")
-    
-    if [[ -n "$web_v4" ]]; then
-        echo -e "${Info} 网页获取 v4 版本: ${Yellow_font_prefix}${web_v4}${Font_color_suffix}"
-        compareVersions "${snell_v4_version}" "$web_v4"
-        case $? in
-            1) echo -e "${Info} v4 版本状态: 脚本内置版本与网页版本相同" ;;
-            0) echo -e "${Info} v4 版本状态: 脚本内置版本比网页版本更新" ;;
-            2) echo -e "${Tip} v4 版本状态: 网页版本比脚本内置版本更新" ;;
-        esac
-    fi
-    
-    if [[ -n "$web_v5" ]]; then
-        echo -e "${Info} 网页获取 v5 版本: ${Yellow_font_prefix}${web_v5}${Font_color_suffix}"
-        compareVersions "${snell_v5_version}" "$web_v5"
-        case $? in
-            1) echo -e "${Info} v5 版本状态: 脚本内置版本与网页版本相同" ;;
-            0) echo -e "${Info} v5 版本状态: 脚本内置版本比网页版本更新" ;;
-            2) echo -e "${Tip} v5 版本状态: 网页版本比脚本内置版本更新" ;;
-        esac
-    fi
-    
-    sleep 3s
-    startMenu
-}
-
-# 卸载 Snell
-uninstallSnell(){
-	checkInstalledStatus
-	echo "确定要卸载 Snell Server ? (y/N)"
-	echo
-	read -e -p "(默认: n):" unyn
-	[[ -z ${unyn} ]] && unyn="n"
-	if [[ ${unyn} == [Yy] ]]; then
-		systemctl stop snell-server
-        systemctl disable snell-server
-		echo -e "${Info} 移除主程序..."
-		rm -rf "${snell_bin}"
-		echo -e "${Info} 配置文件暂保留..."
-		echo && echo "Snell Server 卸载完成！" && echo
-	else
-		echo && echo "卸载已取消..." && echo
-	fi
-    sleep 3s
-    startMenu
-}
-
-# 获取 IPv4 地址
-getIpv4(){
-	ipv4=$(wget -qO- -4 -t1 -T2 ipinfo.io/ip)
-	if [[ -z "${ipv4}" ]]; then
-		ipv4=$(wget -qO- -4 -t1 -T2 api.ip.sb/ip)
-		if [[ -z "${ipv4}" ]]; then
-			ipv4=$(wget -qO- -4 -t1 -T2 members.3322.org/dyndns/getip)
-			if [[ -z "${ipv4}" ]]; then
-				ipv4="IPv4_Error"
-			fi
-		fi
-	fi
-}
-
-# 获取 IPv6 地址
-getIpv6(){
-	ip6=$(wget -qO- -6 -t1 -T2 ifconfig.co)
-	if [[ -z "${ip6}" ]]; then
-		ip6="IPv6_Error"
-	fi
-}
-
-# 查看配置信息
-viewConfig(){
-    checkInstalledStatus
-    readConfig
-    getIpv4
-    getIpv6
-    clear && echo
-    echo -e "Snell Server 配置信息："
-    echo -e "—————————————————————————"
-    if [[ "${ipv4}" != "IPv4_Error" ]]; then
-        echo -e " IPv4 地址\t: ${Green_font_prefix}${ipv4}${Font_color_suffix}"
-    fi
-    if [[ "${ip6}" != "IPv6_Error" ]]; then
-        echo -e " IPv6 地址\t: ${Green_font_prefix}${ip6}${Font_color_suffix}"
-    fi
-    echo -e " 端口\t\t: ${Green_font_prefix}${port}${Font_color_suffix}"
-    echo -e " 密钥\t\t: ${Green_font_prefix}${psk}${Font_color_suffix}"
-    echo -e " OBFS\t\t: ${Green_font_prefix}${obfs}${Font_color_suffix}"
-    echo -e " 域名\t\t: ${Green_font_prefix}${host}${Font_color_suffix}"
-    echo -e " IPv6\t\t: ${Green_font_prefix}${ipv6}${Font_color_suffix}"
-    echo -e " TFO\t\t: ${Green_font_prefix}${tfo}${Font_color_suffix}"
-    echo -e " DNS\t\t: ${Green_font_prefix}${dns}${Font_color_suffix}"
-    echo -e " 版本\t\t: ${Green_font_prefix}${ver}${Font_color_suffix}"
-    echo -e "—————————————————————————"
-    echo -e "${Info} Surge 配置："
-    if [[ "${ipv4}" != "IPv4_Error" ]]; then
-        if [[ "${obfs}" == "off" ]]; then
-            echo -e "$(uname -n) = snell, ${ipv4}, ${port}, psk=${psk}, version=${ver}, tfo=${tfo}, reuse=true, ecn=true"
-        else
-            echo -e "$(uname -n) = snell, ${ipv4}, ${port}, psk=${psk}, version=${ver}, tfo=${tfo}, obfs=${obfs}, obfs-host=${host}, reuse=true, ecn=true"
-        fi
-    elif [[ "${ip6}" != "IPv6_Error" ]]; then
-        if [[ "${obfs}" == "off" ]]; then
-            echo -e "$(uname -n) = snell, [${ip6}], ${port}, psk=${psk}, version=${ver}, tfo=${tfo}, reuse=true, ecn=true"
-        else
-            echo -e "$(uname -n) = snell, [${ip6}], ${port}, psk=${psk}, version=${ver}, tfo=${tfo}, obfs=${obfs}, obfs-host=${host}, reuse=true, ecn=true"
-        fi
-    else
-        echo -e "${Error} 无法获取 IP 地址！"
-    fi
-    echo -e "—————————————————————————"
-    beforeStartMenu
-}
-
-
-# 查看运行状态
-viewStatus(){
-	echo -e "${Info} 获取 Snell Server 活动日志 ……"
-	echo -e "${Tip} 返回主菜单请按 q ！"
-	systemctl status snell-server
-	startMenu
-}
-
-# 检查地理位置（用于更新脚本源选择）
-geo_check() {
-    api_list="https://blog.cloudflare.com/cdn-cgi/trace https://dash.cloudflare.com/cdn-cgi/trace https://cf-ns.com/cdn-cgi/trace"
-    ua="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
-    set -- $api_list
-    for url in $api_list; do
-        text="$(curl -A "$ua" -m 10 -s $url)"
-        endpoint="$(echo $text | sed -n 's/.*h=\([^ ]*\).*/\1/p')"
-        if echo $text | grep -qw 'CN'; then
-            isCN=true
-            break
-        elif echo $url | grep -q $endpoint; then
-            break
-        fi
-    done
-}
-
-# 更新脚本
-updateShell(){
-    geo_check
-    if [ ! -z "$isCN" ]; then
-        shell_url="https://gitee.com/ten/Snell/raw/master/Snell.sh"
-    else
-        shell_url="https://raw.githubusercontent.com/xOS/Snell/master/Snell.sh"
-    fi
-
-    echo -e "当前版本为 [ ${sh_ver} ]，开始检测最新版本..."
-    sh_new_ver=$(wget --no-check-certificate -qO- "$shell_url"|grep 'sh_ver="'|awk -F "=" '{print $NF}'|sed 's/\"//g'|head -1)
-    [[ -z ${sh_new_ver} ]] && echo -e "${Error} 检测最新版本失败！" && startMenu
-    if [[ ${sh_new_ver} != ${sh_ver} ]]; then
-        echo -e "发现新版本[ ${sh_new_ver} ]，是否更新？[Y/n]"
-        read -p "(默认: y):" yn
-        [[ -z "${yn}" ]] && yn="y"
-        if [[ ${yn} == [Yy] ]]; then
-            wget -O snell.sh --no-check-certificate "$shell_url" && chmod +x snell.sh
-            echo -e "脚本已更新为最新版本[ ${sh_new_ver} ]！"
-            echo -e "3s后执行新脚本"
-            sleep 3s
-            exec bash snell.sh
-        else
-            echo && echo "	已取消..." && echo
-            sleep 3s
-            startMenu
-        fi
-    else
-        echo -e "当前已是最新版本[ ${sh_new_ver} ]！"
-        sleep 3s
-        startMenu
+    if [[ "$HTTP_X_AUTH_TOKEN" != "$ADMIN_TOKEN" ]]; then
+        unauthorized
     fi
 }
 
-
-# 返回主菜单前提示
-beforeStartMenu() {
-    echo && echo -n -e "${Yellow_font_prefix}* 按回车返回主菜单 *${Font_color_suffix}" && read temp
-    startMenu
-}
-
-# 显示版本检查进度
-showVersionCheckProgress(){
-    local check_duration=${1:-3}  # 检查预期耗时，默认3秒
-    echo -e "${Info} 正在检查 Snell 版本信息..."
-    echo -n "检查进度: "
-    
-    # 根据检查时间动态调整进度条
-    local steps=30
-    local step_time=$(echo "scale=2; $check_duration / $steps" | bc 2>/dev/null || echo "0.1")
-    
-    for i in $(seq 1 $steps); do
-        echo -n -e "${Green_font_prefix}█${Font_color_suffix}"
-        sleep $step_time
-    done
-    echo -e " ${Green_font_prefix}完成${Font_color_suffix}"
-    echo -e "${Info} 版本检查完成，正在加载主菜单..."
-    sleep 0.3
-}
-
-# 检查是否需要进行版本检查
-shouldCheckVersion(){
-    local check_interval=3600  # 1小时 = 3600秒
-    local last_check_file="/tmp/snell_last_check"
-    local current_time=$(date +%s)
-    
-    # 如果没有安装 Snell，不需要检查
-    if [[ ! -e ${snell_bin} || ! -e ${snell_conf} ]]; then
-        return 1  # 不需要检查
-    fi
-    
-    # 如果检查记录文件不存在，说明是第一次检查
-    if [[ ! -f "$last_check_file" ]]; then
-        echo "$current_time" > "$last_check_file"
-        return 0  # 需要检查
-    fi
-    
-    # 读取上次检查时间
-    local last_check_time
-    last_check_time=$(cat "$last_check_file" 2>/dev/null)
-    
-    # 如果文件内容无效，重新记录并检查
-    if [[ ! "$last_check_time" =~ ^[0-9]+$ ]]; then
-        echo "$current_time" > "$last_check_file"
-        return 0  # 需要检查
-    fi
-    
-    # 计算时间差
-    local time_diff=$((current_time - last_check_time))
-    
-    # 如果超过1小时，需要检查
-    if [[ $time_diff -ge $check_interval ]]; then
-        echo "$current_time" > "$last_check_file"
-        return 0  # 需要检查
-    fi
-    
-    return 1  # 不需要检查
-}
-
-# 检查版本更新（带进度显示）
-checkVersionUpdateWithProgress(){
-    # 先检查是否需要进行版本检查
-    if shouldCheckVersion; then
-        echo -e "${Info} 正在检查 Snell 版本信息..."
-        
-        # 显示绿色进度条
-        (
-            echo -n "检查进度: "
-            for i in {1..30}; do
-                echo -n -e "${Green_font_prefix}█${Font_color_suffix}"
-                sleep 0.1
-            done
-            echo -e " ${Green_font_prefix}完成${Font_color_suffix}"
-        ) &
-        progress_pid=$!
-        
-        # 在后台进行版本检查
-        updateBuiltinVersions false >/dev/null 2>&1
-        checkVersionUpdate false >/dev/null 2>&1
-        
-        # 等待进度条完成
-        wait $progress_pid
-        
-        echo -e "${Info} 版本检查完成，正在加载主菜单..."
-        sleep 0.5
-        clear
-    else
-        # 静默进行版本检查（使用缓存）
-        if [[ -e ${snell_bin} && -e ${snell_conf} ]]; then
-            updateBuiltinVersions false >/dev/null 2>&1
-            checkVersionUpdate false >/dev/null 2>&1
-        fi
-    fi
-}
-
-# 主菜单
-startMenu(){
-    clear
-    checkRoot
-    checkSys
-    sysArch
-    action=$1
-    
-    # 检查版本更新（在显示菜单前）
-    checkVersionUpdateWithProgress
-    
-    # 检查是否安装了 v4 版本，需要显示 v4 到 v5 更新选项
-    show_v4_to_v5_option=false
-    show_update_option=false
-    
-    if [[ -e ${snell_bin} && -e ${snell_conf} ]]; then
-        current_ver=$(cat ${snell_conf}|grep 'version = '|awk -F 'version = ' '{print $NF}')
-        if [[ "$current_ver" == "4" ]]; then
-            show_v4_to_v5_option=true
-        fi
-        # 只有 v4 和 v5 显示更新选项，v2 和 v3 不显示
-        if [[ "$current_ver" == "4" || "$current_ver" == "5" ]]; then
-            show_update_option=true
-        fi
-    fi
-    
-    echo && echo -e "  
-==============================
-Snell Server 管理脚本 ${Red_font_prefix}[v${sh_ver}]${Font_color_suffix}
-==============================
- ${Green_font_prefix} 0.${Font_color_suffix} 更新脚本
-——————————————————————————————
- ${Green_font_prefix} 1.${Font_color_suffix} 安装 Snell Server
- ${Green_font_prefix} 2.${Font_color_suffix} 卸载 Snell Server"
-    
-    # 根据不同情况显示更新选项
-    if [[ "$show_v4_to_v5_option" == true ]]; then
-        # v4 版本，同时显示两个更新选项
-        if [[ "$update_available" == true ]]; then
-            echo -e " ${Green_font_prefix} 3.${Font_color_suffix} 更新 Snell Server ${Yellow_font_prefix}(可更新)${Font_color_suffix}"
-        else
-            echo -e " ${Green_font_prefix} 3.${Font_color_suffix} 更新 Snell Server"
-        fi
-        echo -e " ${Green_font_prefix} 4.${Font_color_suffix} v4 更新到 v5
-——————————————————————————————
- ${Green_font_prefix} 5.${Font_color_suffix} 启动 Snell Server
- ${Green_font_prefix} 6.${Font_color_suffix} 停止 Snell Server
- ${Green_font_prefix} 7.${Font_color_suffix} 重启 Snell Server
-——————————————————————————————
- ${Green_font_prefix} 8.${Font_color_suffix} 设置 配置信息
- ${Green_font_prefix} 9.${Font_color_suffix} 查看 配置信息
- ${Green_font_prefix}10.${Font_color_suffix} 查看 运行状态
-——————————————————————————————
- ${Green_font_prefix}00.${Font_color_suffix} 退出脚本"
-        menu_max=10
-    elif [[ "$show_update_option" == true ]]; then
-        if [[ "$update_available" == true ]]; then
-            echo -e " ${Green_font_prefix} 3.${Font_color_suffix} 更新 Snell Server ${Yellow_font_prefix}(可更新)${Font_color_suffix}"
-        else
-            echo -e " ${Green_font_prefix} 3.${Font_color_suffix} 更新 Snell Server"
-        fi
-        echo -e "——————————————————————————————
- ${Green_font_prefix} 4.${Font_color_suffix} 启动 Snell Server
- ${Green_font_prefix} 5.${Font_color_suffix} 停止 Snell Server
- ${Green_font_prefix} 6.${Font_color_suffix} 重启 Snell Server
-——————————————————————————————
- ${Green_font_prefix} 7.${Font_color_suffix} 设置 配置信息
- ${Green_font_prefix} 8.${Font_color_suffix} 查看 配置信息
- ${Green_font_prefix} 9.${Font_color_suffix} 查看 运行状态
-——————————————————————————————
- ${Green_font_prefix}00.${Font_color_suffix} 退出脚本"
-        menu_max=9
-    else
-        echo -e "——————————————————————————————
- ${Green_font_prefix} 3.${Font_color_suffix} 启动 Snell Server
- ${Green_font_prefix} 4.${Font_color_suffix} 停止 Snell Server
- ${Green_font_prefix} 5.${Font_color_suffix} 重启 Snell Server
-——————————————————————————————
- ${Green_font_prefix} 6.${Font_color_suffix} 设置 配置信息
- ${Green_font_prefix} 7.${Font_color_suffix} 查看 配置信息
- ${Green_font_prefix} 8.${Font_color_suffix} 查看 运行状态
-——————————————————————————————
- ${Green_font_prefix}00.${Font_color_suffix} 退出脚本"
-        menu_max=8
-    fi
-    
-    echo "==============================" && echo
-    if [[ -e ${snell_bin} ]]; then
-        checkStatus
-        if [[ "$status" == "running" ]]; then
-            echo -e " 当前状态: ${Green_font_prefix}已安装${Yellow_font_prefix}[v$(cat ${snell_conf}|grep 'version = '|awk -F 'version = ' '{print $NF}')]${Font_color_suffix}并${Green_font_prefix}已启动${Font_color_suffix}"
-        else
-            echo -e " 当前状态: ${Green_font_prefix}已安装${Yellow_font_prefix}[v$(cat ${snell_conf}|grep 'version = '|awk -F 'version = ' '{print $NF}')]${Font_color_suffix}但${Red_font_prefix}未启动${Font_color_suffix}"
-        fi
-    else
-        echo -e " 当前状态: ${Red_font_prefix}未安装${Font_color_suffix}"
-    fi
+unauthorized() {
+    echo "Status: 401 Unauthorized"
+    echo "Content-Type: application/json"
     echo
-    
-    if [[ "$show_v4_to_v5_option" == true ]]; then
-        read -e -p " 请输入数字[0-10]:" num
-    elif [[ "$show_update_option" == true ]]; then
-        read -e -p " 请输入数字[0-9]:" num
+    echo '{"error":"unauthorized"}'
+    exit 0
+}
+
+bad_request() {
+    local message="${1:-invalid_request}"
+    echo "Status: 400 Bad Request"
+    echo "Content-Type: application/json"
+    echo
+    printf '{"error":"%s"}' "$message"
+    exit 0
+}
+
+not_found() {
+    echo "Status: 404 Not Found"
+    echo "Content-Type: application/json"
+    echo
+    echo '{"error":"not_found"}'
+    exit 0
+}
+
+json_response() {
+    echo "Content-Type: application/json"
+    echo
+    cat
+}
+
+read_body() {
+    if [[ -n "${CONTENT_LENGTH:-}" ]]; then
+        dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null
     else
-        read -e -p " 请输入数字[0-8]:" num
-    fi
-    
-    # 根据不同菜单模式处理用户输入
-    if [[ "$show_v4_to_v5_option" == true ]]; then
-        case "$num" in
-            0)
-            updateShell
-            ;;
-            1)
-            installSnell
-            ;;
-            2)
-            uninstallSnell
-            ;;
-            3)
-            updateSnellServer
-            ;;
-            4)
-            updateV4toV5
-            ;;
-            5)
-            startSnell
-            ;;
-            6)
-            stopSnell
-            ;;
-            7)
-            restartSnell
-            ;;
-            8)
-            setConfig
-            ;;
-            9)
-            viewConfig
-            ;;
-            10)
-            viewStatus
-            ;;
-            00)
-            exit 1
-            ;;
-            *)
-            echo -e "请输入正确数字${Yellow_font_prefix}[0-10]${Font_color_suffix}"
-            sleep 2s
-            startMenu
-            ;;
-        esac
-    elif [[ "$show_update_option" == true ]]; then
-        case "$num" in
-            0)
-            updateShell
-            ;;
-            1)
-            installSnell
-            ;;
-            2)
-            uninstallSnell
-            ;;
-            3)
-            updateSnellServer
-            ;;
-            4)
-            startSnell
-            ;;
-            5)
-            stopSnell
-            ;;
-            6)
-            restartSnell
-            ;;
-            7)
-            setConfig
-            ;;
-            8)
-            viewConfig
-            ;;
-            9)
-            viewStatus
-            ;;
-            00)
-            exit 1
-            ;;
-            *)
-            echo -e "请输入正确数字${Yellow_font_prefix}[0-9]${Font_color_suffix}"
-            sleep 2s
-            startMenu
-            ;;
-        esac
-    else
-        case "$num" in
-            0)
-            updateShell
-            ;;
-            1)
-            installSnell
-            ;;
-            2)
-            uninstallSnell
-            ;;
-            3)
-            startSnell
-            ;;
-            4)
-            stopSnell
-            ;;
-            5)
-            restartSnell
-            ;;
-            6)
-            setConfig
-            ;;
-            7)
-            viewConfig
-            ;;
-            8)
-            viewStatus
-            ;;
-            00)
-            exit 1
-            ;;
-            *)
-            echo -e "请输入正确数字${Yellow_font_prefix}[0-8]${Font_color_suffix}"
-            sleep 2s
-            startMenu
-            ;;
-        esac
+        cat
     fi
 }
 
-startMenu
+ensure_db() {
+    if [[ ! -f "$DB_FILE" ]]; then
+        cat <<'JSON' >"$DB_FILE"
+{
+  "users": []
+}
+JSON
+    fi
+}
+
+usage_json() {
+    local usage="{}"
+    if command -v iptables-save >/dev/null 2>&1; then
+        while read -r username bytes; do
+            usage=$(jq --arg u "$username" --argjson b "$bytes" '. + {($u): $b}' <<<"$usage")
+        done < <(iptables-save -c 2>/dev/null | awk '/-A SNELL-TRACK/ && /--comment "snell:/ {
+            match($0, /--comment "snell:([^"\n]+)"/, comment)
+            match($0, /-c ([0-9]+) ([0-9]+)/, counters)
+            if (comment[1] != "" && counters[2] != "") {
+                printf "%s %s\n", comment[1], counters[2]
+            }
+        }')
+    fi
+    echo "$usage"
+}
+
+list_users() {
+    ensure_db
+    local usage
+    usage=$(usage_json)
+    jq --argjson usage "$usage" '.users // [] | map(.used_bytes = ($usage[.username] // 0))' "$DB_FILE" | json_response
+}
+
+available_port() {
+    local port
+    for port in $(seq 10240 65100); do
+        if ! ss -ltn "sport = :$port" >/dev/null 2>&1; then
+            echo "$port"
+            return
+        fi
+    done
+    echo "" >&2
+}
+
+create_user() {
+    ensure_db
+    local body
+    body=$(read_body)
+    if [[ -z "$body" ]]; then
+        bad_request "empty_body"
+    fi
+    local username
+    username=$(jq -r '.username // empty' <<<"$body")
+    if [[ -z "$username" ]]; then
+        bad_request "missing_username"
+    fi
+    if jq -e --arg u "$username" '.users[]? | select(.username == $u)' "$DB_FILE" >/dev/null; then
+        bad_request "user_exists"
+    fi
+    local port
+    port=$(jq -r '.port // empty' <<<"$body")
+    if [[ -z "$port" || "$port" == "null" ]]; then
+        port=$(available_port)
+    fi
+    if [[ -z "$port" ]]; then
+        bad_request "no_free_port"
+    fi
+    local psk
+    psk=$(jq -r '.psk // empty' <<<"$body")
+    if [[ -z "$psk" ]]; then
+        psk=$(openssl rand -base64 24 | tr -d '\n')
+    fi
+    local limit_gb obfs ipv6 dns note token
+    limit_gb=$(jq -r '.limit_gb // 0' <<<"$body")
+    obfs=$(jq -r '.obfs // "off"' <<<"$body")
+    ipv6=$(jq -r '.ipv6 // false' <<<"$body")
+    dns=$(jq -r '.dns // ""' <<<"$body")
+    note=$(jq -r '.note // ""' <<<"$body")
+    token=$(openssl rand -hex 16)
+
+    cat <<EOF >"$USER_DIR/$username.conf"
+[snell-server]
+listen = 0.0.0.0:$port
+psk = $psk
+obfs = $obfs
+ipv6 = $ipv6
+EOF
+    if [[ -n "$dns" && "$dns" != "null" ]]; then
+        echo "dns = $dns" >>"$USER_DIR/$username.conf"
+    fi
+
+    tmp=$(mktemp)
+    jq --arg username "$username" \
+       --argjson port "$port" \
+       --arg psk "$psk" \
+       --arg obfs "$obfs" \
+       --argjson limit "$limit_gb" \
+       --argjson ipv6 "$ipv6" \
+       --arg dns "$dns" \
+       --arg note "$note" \
+       --arg token "$token" \
+       --arg created "$(date -Iseconds)" \
+       '.users += [{"username":$username,"port":$port,"psk":$psk,"obfs":$obfs,"limit_gb":$limit,"ipv6":$ipv6,"dns":$dns,"note":$note,"subscription_token":$token,"created_at":$created}]' "$DB_FILE" >"$tmp"
+    mv "$tmp" "$DB_FILE"
+
+    systemctl enable --now "snell-server@$username" >/dev/null 2>&1 || true
+
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -C "$CHAIN" -p tcp --dport "$port" -m comment --comment "snell:$username" -j RETURN 2>/dev/null || \
+        iptables -A "$CHAIN" -p tcp --dport "$port" -m comment --comment "snell:$username" -j RETURN
+    fi
+
+    jq -n --arg username "$username" --argjson port "$port" --arg psk "$psk" --arg token "$token" '{username:$username, port:$port, psk:$psk, subscription_token:$token}' | json_response
+}
+
+delete_user() {
+    ensure_db
+    local body username
+    body=$(read_body)
+    username=$(jq -r '.username // empty' <<<"$body")
+    if [[ -z "$username" ]]; then
+        bad_request "missing_username"
+    fi
+    if ! jq -e --arg u "$username" '.users[]? | select(.username == $u)' "$DB_FILE" >/dev/null; then
+        not_found
+    fi
+
+    systemctl disable --now "snell-server@$username" >/dev/null 2>&1 || true
+    rm -f "$USER_DIR/$username.conf"
+
+    tmp=$(mktemp)
+    jq --arg u "$username" '.users = (.users // [] | map(select(.username != $u)))' "$DB_FILE" >"$tmp"
+    mv "$tmp" "$DB_FILE"
+
+    if command -v iptables >/dev/null 2>&1; then
+        while read -r num _; do
+            iptables -D "$CHAIN" "$num"
+            break
+        done < <(iptables -L "$CHAIN" --line-numbers 2>/dev/null | awk -v u="snell:$username" '$0 ~ u {print $1, $0}')
+    fi
+
+    jq -n '{ok:true}' | json_response
+}
+
+reset_usage() {
+    local body username
+    body=$(read_body)
+    username=$(jq -r '.username // empty' <<<"$body")
+    if [[ -z "$username" ]]; then
+        bad_request "missing_username"
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        while read -r num _; do
+            iptables -Z "$CHAIN" "$num"
+        done < <(iptables -L "$CHAIN" --line-numbers 2>/dev/null | awk -v u="snell:$username" '$0 ~ u {print $1, $0}')
+    fi
+    jq -n '{ok:true}' | json_response
+}
+
+get_settings() {
+    ensure_db
+    local usage
+    usage=$(usage_json)
+    jq --argjson usage "$usage" --arg port "$ADMIN_PORT" --arg host "$SERVER_HOST" --arg token "$ADMIN_TOKEN" '{admin_port:$port, server_host:$host, admin_token:$token, subscription_base:("http://" + $host + ":" + $port + "/cgi-bin/subscribe.sh?token=")}' "$DB_FILE" >"$TMP_JSON"
+    json_response <"$TMP_JSON"
+}
+
+update_settings() {
+    local body new_host
+    body=$(read_body)
+    new_host=$(jq -r '.server_host // empty' <<<"$body")
+    if [[ -z "$new_host" ]]; then
+        bad_request "missing_server_host"
+    fi
+    cat <<EOF >"$ADMIN_CONFIG"
+ADMIN_PORT=$ADMIN_PORT
+ADMIN_TOKEN=$ADMIN_TOKEN
+SERVER_HOST=$new_host
+EOF
+    jq -n --arg server_host "$new_host" '{server_host:$server_host}' | json_response
+}
+
+main() {
+    load_config
+    ensure_db
+    require_auth
+    local action=""
+    if [[ -n "${QUERY_STRING:-}" ]]; then
+        IFS='&' read -ra pairs <<<"$QUERY_STRING"
+        for pair in "${pairs[@]}"; do
+            IFS='=' read -r key value <<<"$pair"
+            if [[ "$key" == "action" ]]; then
+                action=$(urldecode "$value")
+            fi
+        done
+    fi
+    case "$action" in
+        list-users)
+            list_users
+            ;;
+        create-user)
+            create_user
+            ;;
+        delete-user)
+            delete_user
+            ;;
+        reset-usage)
+            reset_usage
+            ;;
+        get-settings)
+            get_settings
+            ;;
+        update-settings)
+            update_settings
+            ;;
+        *)
+            bad_request "unknown_action"
+            ;;
+    esac
+}
+
+main
+CGI
+    chmod 755 "$CGI_DIR/api.sh"
+
+    cat <<'CGI' >"$CGI_DIR/subscribe.sh"
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_DIR="/etc/snell"
+DB_FILE="$BASE_DIR/users.json"
+ADMIN_CONFIG="$BASE_DIR/admin.conf"
+
+urldecode() {
+    local data="${1//+/ }"
+    printf '%b' "${data//%/\\x}"
+}
+
+load_config() {
+    # shellcheck disable=SC1090
+    source "$ADMIN_CONFIG"
+    SERVER_HOST=${SERVER_HOST:-$(hostname -I | awk '{print $1}')}
+}
+
+ensure_db() {
+    if [[ ! -f "$DB_FILE" ]]; then
+        echo "Status: 404 Not Found"
+        echo "Content-Type: application/json"
+        echo
+        echo '{"error":"not_found"}'
+        exit 0
+    fi
+}
+
+subscription_response() {
+    local token="$1"
+    local data
+    data=$(jq -r --arg t "$token" '.users[]? | select(.subscription_token == $t)' "$DB_FILE") || true
+    if [[ -z "$data" || "$data" == "null" ]]; then
+        echo "Status: 404 Not Found"
+        echo "Content-Type: application/json"
+        echo
+        echo '{"error":"not_found"}'
+        exit 0
+    fi
+    local username
+    username=$(jq -r '.username' <<<"$data")
+    local port
+    port=$(jq -r '.port' <<<"$data")
+    local psk
+    psk=$(jq -r '.psk' <<<"$data")
+    local obfs
+    obfs=$(jq -r '.obfs' <<<"$data")
+    local note
+    note=$(jq -r '.note' <<<"$data")
+
+    echo "Content-Type: application/json"
+    echo
+    jq -n --arg username "$username" --arg host "$SERVER_HOST" --argjson port "$port" --arg psk "$psk" --arg obfs "$obfs" --arg note "$note" '{type:"snell", user:$username, server:{host:$host, port:$port}, psk:$psk, obfs:$obfs, note:$note}'
+}
+
+main() {
+    load_config
+    ensure_db
+    local token=""
+    if [[ -n "${QUERY_STRING:-}" ]]; then
+        IFS='&' read -ra pairs <<<"$QUERY_STRING"
+        for pair in "${pairs[@]}"; do
+            IFS='=' read -r key value <<<"$pair"
+            if [[ "$key" == "token" ]]; then
+                token=$(urldecode "$value")
+            fi
+        done
+    fi
+    if [[ -z "$token" ]]; then
+        echo "Status: 400 Bad Request"
+        echo "Content-Type: application/json"
+        echo
+        echo '{"error":"missing_token"}'
+        exit 0
+    fi
+    subscription_response "$token"
+}
+
+main
+CGI
+    chmod 755 "$CGI_DIR/subscribe.sh"
+
+    cat <<'HTML' >"$WEB_DIR/index.html"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Snell Admin</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+    <header>
+        <h1>Snell Web 管理面板</h1>
+        <p>管理 Snell 多用户及订阅</p>
+    </header>
+    <main>
+        <section class="card">
+            <h2>面板设置</h2>
+            <div class="settings">
+                <label>服务器地址
+                    <input type="text" id="server-host" placeholder="example.com" />
+                </label>
+                <button id="save-settings">保存</button>
+                <div class="token">
+                    <span>管理令牌：</span>
+                    <code id="admin-token"></code>
+                </div>
+            </div>
+        </section>
+        <section class="card">
+            <h2>新增用户</h2>
+            <form id="create-user-form">
+                <div class="grid">
+                    <label>用户名
+                        <input type="text" name="username" required />
+                    </label>
+                    <label>端口
+                        <input type="number" name="port" min="1" max="65535" placeholder="自动分配" />
+                    </label>
+                    <label>PSK
+                        <input type="text" name="psk" placeholder="自动生成" />
+                    </label>
+                    <label>流量上限 (GB)
+                        <input type="number" name="limit_gb" min="0" value="0" />
+                    </label>
+                    <label>Obfs
+                        <select name="obfs">
+                            <option value="off">关闭</option>
+                            <option value="tls">TLS</option>
+                            <option value="http">HTTP</option>
+                        </select>
+                    </label>
+                    <label>DNS (可选, 逗号分隔)
+                        <input type="text" name="dns" placeholder="1.1.1.1,8.8.8.8" />
+                    </label>
+                </div>
+                <label>备注
+                    <input type="text" name="note" placeholder="备注信息" />
+                </label>
+                <button type="submit">创建用户</button>
+            </form>
+        </section>
+        <section class="card">
+            <h2>用户列表</h2>
+            <table id="users-table">
+                <thead>
+                    <tr>
+                        <th>用户名</th>
+                        <th>端口</th>
+                        <th>已用流量</th>
+                        <th>流量上限</th>
+                        <th>订阅链接</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </section>
+    </main>
+    <template id="user-row-template">
+        <tr>
+            <td class="username"></td>
+            <td class="port"></td>
+            <td class="used"></td>
+            <td class="limit"></td>
+            <td class="subscription">
+                <input type="text" readonly />
+                <button class="copy">复制</button>
+            </td>
+            <td class="actions">
+                <button class="reset">清零</button>
+                <button class="delete">删除</button>
+            </td>
+        </tr>
+    </template>
+    <script src="/app.js"></script>
+</body>
+</html>
+HTML
+
+    cat <<'CSS' >"$WEB_DIR/style.css"
+:root {
+    color-scheme: light dark;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+}
+
+body {
+    margin: 0;
+    padding: 0 1rem 2rem;
+}
+
+header {
+    text-align: center;
+    padding: 2rem 0 1rem;
+}
+
+h1 {
+    margin: 0;
+    font-size: 2.4rem;
+}
+
+main {
+    max-width: 960px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+}
+
+.card {
+    background: rgba(30, 41, 59, 0.85);
+    border-radius: 1rem;
+    padding: 1.5rem;
+    box-shadow: 0 12px 30px rgba(15, 23, 42, 0.35);
+}
+
+.card h2 {
+    margin-top: 0;
+}
+
+label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    font-weight: 600;
+    margin-bottom: 0.75rem;
+}
+
+input, select, button {
+    font: inherit;
+    padding: 0.55rem 0.75rem;
+    border-radius: 0.6rem;
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    background: rgba(15, 23, 42, 0.6);
+    color: inherit;
+}
+
+button {
+    cursor: pointer;
+    background: linear-gradient(135deg, #6366f1, #8b5cf6);
+    border: none;
+    color: white;
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 10px 22px rgba(99, 102, 241, 0.35);
+}
+
+button:active {
+    transform: translateY(1px);
+}
+
+#users-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+#users-table th, #users-table td {
+    border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+    padding: 0.75rem;
+    text-align: left;
+}
+
+#users-table tbody tr:hover {
+    background: rgba(30, 41, 59, 0.75);
+}
+
+#users-table input[type="text"] {
+    width: 100%;
+    background: rgba(15, 23, 42, 0.55);
+}
+
+.subscription {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+}
+
+.subscription button {
+    padding: 0.45rem 0.9rem;
+}
+
+.settings {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.settings .token {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+}
+
+@media (max-width: 720px) {
+    .grid {
+        grid-template-columns: 1fr;
+    }
+    .subscription {
+        flex-direction: column;
+    }
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 0.75rem;
+}
+CSS
+
+    cat <<'JS' >"$WEB_DIR/app.js"
+(() => {
+    const api = async (action, options = {}) => {
+        const token = getToken();
+        const headers = options.headers || {};
+        headers['X-Auth-Token'] = token;
+        if (options.body && !(options.body instanceof FormData)) {
+            headers['Content-Type'] = 'application/json';
+        }
+        const response = await fetch(`/cgi-bin/api.sh?action=${encodeURIComponent(action)}`, {
+            ...options,
+            headers
+        });
+        if (!response.ok) {
+            const err = await response.text();
+            throw new Error(err || '请求失败');
+        }
+        return response.json();
+    };
+
+    const getToken = () => {
+        let token = localStorage.getItem('snell-admin-token');
+        if (!token) {
+            token = prompt('请输入管理令牌');
+            if (!token) {
+                throw new Error('缺少令牌');
+            }
+            localStorage.setItem('snell-admin-token', token);
+        }
+        return token;
+    };
+
+    const fmtBytes = (bytes) => {
+        if (!bytes) return '0 B';
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        let size = Number(bytes);
+        let i = 0;
+        while (size >= 1024 && i < units.length - 1) {
+            size /= 1024;
+            i++;
+        }
+        return `${size.toFixed(2)} ${units[i]}`;
+    };
+
+    const renderUsers = (data, settings) => {
+        const tbody = document.querySelector('#users-table tbody');
+        tbody.innerHTML = '';
+        const template = document.querySelector('#user-row-template');
+        (data || []).forEach((user) => {
+            const row = template.content.cloneNode(true);
+            row.querySelector('.username').textContent = user.username;
+            row.querySelector('.port').textContent = user.port;
+            row.querySelector('.used').textContent = fmtBytes(user.used_bytes);
+            row.querySelector('.limit').textContent = user.limit_gb ? `${user.limit_gb} GB` : '不限';
+            const subscriptionInput = row.querySelector('.subscription input');
+            subscriptionInput.value = `${settings.subscription_base}${user.subscription_token}`;
+            row.querySelector('.subscription .copy').addEventListener('click', () => {
+                navigator.clipboard.writeText(subscriptionInput.value);
+                alert('已复制订阅链接');
+            });
+            row.querySelector('.reset').addEventListener('click', async () => {
+                if (!confirm(`确定要清零 ${user.username} 的流量吗？`)) return;
+                await api('reset-usage', {
+                    method: 'POST',
+                    body: JSON.stringify({ username: user.username })
+                });
+                await refresh();
+            });
+            row.querySelector('.delete').addEventListener('click', async () => {
+                if (!confirm(`确定要删除用户 ${user.username} 吗？`)) return;
+                await api('delete-user', {
+                    method: 'POST',
+                    body: JSON.stringify({ username: user.username })
+                });
+                await refresh();
+            });
+            tbody.appendChild(row);
+        });
+    };
+
+    const loadSettings = async () => {
+        const settings = await api('get-settings');
+        document.querySelector('#server-host').value = settings.server_host || '';
+        document.querySelector('#admin-token').textContent = getToken();
+        return settings;
+    };
+
+    const refresh = async () => {
+        try {
+            const settings = await loadSettings();
+            const users = await api('list-users');
+            renderUsers(users, settings);
+        } catch (err) {
+            console.error(err);
+            alert(`加载失败: ${err.message}`);
+        }
+    };
+
+    document.querySelector('#create-user-form').addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const form = event.target;
+        const formData = new FormData(form);
+        const payload = Object.fromEntries(formData.entries());
+        if (!payload.username) {
+            alert('请输入用户名');
+            return;
+        }
+        ['limit_gb', 'port'].forEach((key) => {
+            if (payload[key]) {
+                payload[key] = Number(payload[key]);
+            } else {
+                delete payload[key];
+            }
+        });
+        payload.ipv6 = false;
+        try {
+            await api('create-user', {
+                method: 'POST',
+                body: JSON.stringify(payload)
+            });
+            form.reset();
+            await refresh();
+        } catch (err) {
+            alert(`创建失败: ${err.message}`);
+        }
+    });
+
+    document.querySelector('#save-settings').addEventListener('click', async () => {
+        const host = document.querySelector('#server-host').value.trim();
+        if (!host) {
+            alert('请输入服务器地址');
+            return;
+        }
+        try {
+            await api('update-settings', {
+                method: 'POST',
+                body: JSON.stringify({ server_host: host })
+            });
+            alert('保存成功');
+            await refresh();
+        } catch (err) {
+            alert(`保存失败: ${err.message}`);
+        }
+    });
+
+    window.addEventListener('load', refresh);
+})();
+JS
+
+    cat <<EOF >"$HTTPD_SERVICE"
+[Unit]
+Description=Snell Admin Web UI
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$WEB_DIR
+ExecStart=/usr/bin/env busybox httpd -f -p 0.0.0.0:${admin_port} -h $WEB_DIR
+Restart=always
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    log_info "Snell Admin panel listening on port $admin_port"
+    log_info "Admin token: $admin_token"
+
+    systemctl daemon-reload
+    systemctl enable --now snell-admin.service
+}
+
+ensure_tracking_chain() {
+    if iptables -t filter -nL "$TRACK_CHAIN" >/dev/null 2>&1; then
+        return
+    fi
+    iptables -N "$TRACK_CHAIN"
+    iptables -C INPUT -p tcp -j "$TRACK_CHAIN" 2>/dev/null || iptables -I INPUT -p tcp -j "$TRACK_CHAIN"
+}
+
+install_stack() {
+    require_root
+    install_dependencies
+    ensure_directories
+    ensure_db
+    download_snell
+    setup_systemd_template
+    ensure_tracking_chain
+    setup_admin_service
+    log_info "Snell server and web UI installation completed."
+    log_info "Access the panel at http://<server_ip>:${ADMIN_PORT:-$DEFAULT_ADMIN_PORT}".
+}
+
+uninstall_stack() {
+    require_root
+    log_warn "Stopping Snell instances..."
+    if [[ -d "$USER_DIR" ]]; then
+        for cfg in "$USER_DIR"/*.conf; do
+            [[ -f "$cfg" ]] || continue
+            name=$(basename "$cfg" .conf)
+            systemctl disable --now "snell-server@$name" >/dev/null 2>&1 || true
+        done
+    fi
+    systemctl disable --now snell-admin.service >/dev/null 2>&1 || true
+    rm -f "$SYSTEMD_TEMPLATE" "$HTTPD_SERVICE"
+    systemctl daemon-reload
+    rm -rf "$ADMIN_DIR" "$BASE_DIR"
+    if iptables -t filter -nL "$TRACK_CHAIN" >/dev/null 2>&1; then
+        iptables -D INPUT -p tcp -j "$TRACK_CHAIN" 2>/dev/null || true
+        iptables -F "$TRACK_CHAIN" 2>/dev/null || true
+        iptables -X "$TRACK_CHAIN" 2>/dev/null || true
+    fi
+    rm -f "$SNELL_BIN"
+    log_info "Snell server removed."
+}
+
+list_users_cli() {
+    ensure_db
+    jq -r '.users[]? | "- " + .username + " (port: " + (.port|tostring) + ", note: " + (.note // "") + ")"' "$DB_FILE"
+}
+
+show_admin_info() {
+    if [[ ! -f "$ADMIN_CONFIG" ]]; then
+        log_error "Admin config not found. Is the panel installed?"
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    source "$ADMIN_CONFIG"
+    log_info "Admin panel port: ${ADMIN_PORT}"
+    log_info "Admin token: ${ADMIN_TOKEN}"
+    log_info "Server host: ${SERVER_HOST}"
+}
+
+cli_usage() {
+    cat <<'USAGE'
+Usage: ./Snell.sh <command>
+
+Commands:
+  install          Install Snell server and web interface
+  uninstall        Remove Snell server and all related files
+  list-users       List configured Snell users
+  admin-info       Show admin panel access information
+USAGE
+}
+
+main() {
+    local cmd="${1:-}"
+    case "$cmd" in
+        install)
+            install_stack
+            ;;
+        uninstall)
+            uninstall_stack
+            ;;
+        list-users)
+            list_users_cli
+            ;;
+        admin-info)
+            show_admin_info
+            ;;
+        *)
+            cli_usage
+            ;;
+    esac
+}
+
+main "$@"
